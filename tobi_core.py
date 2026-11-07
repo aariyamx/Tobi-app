@@ -7,9 +7,10 @@ No Kivy in here, so it can also be tested on a laptop.
 import json
 import os
 import sqlite3
+import ssl
 import time
-
-import requests
+import urllib.error
+import urllib.request
 
 # ---------- 1. STORAGE LOCATION ----------
 # main.py calls set_data_dir(app.user_data_dir) when the app starts.
@@ -202,29 +203,56 @@ def build_messages(user_message, task_mode):
 
 
 # ---------- 5. PROVIDER CALLS ----------
+# We use Python's built-in urllib instead of the 'requests' library. It needs no
+# extra packages, which keeps the Android build simple and reliable.
+def _ssl_context():
+    """HTTPS needs trusted certificates; Android doesn't always provide them to Python."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def http_post_json(url, headers, payload, timeout=60):
+    """POST a JSON body. Returns (status_code, response_text)."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    # Some servers block urllib's default user agent, so we set our own.
+    req.add_header("User-Agent", "TobiApp/0.1")
+    for name, value in headers.items():
+        req.add_header(name, value)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:  # server answered with an error code
+        return e.code, e.read().decode("utf-8", errors="replace")
+
+
 def call_groq(key, model, messages):
-    resp = requests.post(
+    payload = {"model": model, "messages": messages}
+    status, body = http_post_json(
         "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": model, "messages": messages},
-        timeout=60,
+        {"Authorization": f"Bearer {key}"},
+        payload,
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Groq {resp.status_code}: {resp.text[:300]}")
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    if status != 200:
+        raise RuntimeError(f"Groq {status}: {body[:300]}")
+    return json.loads(body)["choices"][0]["message"]["content"].strip()
 
 
 def call_gemini(key, model, messages):
     # Gemini offers an OpenAI-compatible endpoint, so it looks just like Groq.
-    resp = requests.post(
+    payload = {"model": model, "messages": messages}
+    status, body = http_post_json(
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": model, "messages": messages},
-        timeout=60,
+        {"Authorization": f"Bearer {key}"},
+        payload,
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:300]}")
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    if status != 200:
+        raise RuntimeError(f"Gemini {status}: {body[:300]}")
+    return json.loads(body)["choices"][0]["message"]["content"].strip()
 
 
 def _claude_format(messages):
@@ -245,19 +273,15 @@ def _claude_format(messages):
 
 def call_claude(key, model, messages):
     system, turns = _claude_format(messages)
-    resp = requests.post(
+    payload = {"model": model, "max_tokens": 1024, "system": system, "messages": turns}
+    status, body = http_post_json(
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={"model": model, "max_tokens": 1024, "system": system, "messages": turns},
-        timeout=60,
+        {"x-api-key": key, "anthropic-version": "2023-06-01"},
+        payload,
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Claude {resp.status_code}: {resp.text[:300]}")
-    return resp.json()["content"][0]["text"].strip()
+    if status != 200:
+        raise RuntimeError(f"Claude {status}: {body[:300]}")
+    return json.loads(body)["content"][0]["text"].strip()
 
 
 CALLERS = {"groq": call_groq, "gemini": call_gemini, "claude": call_claude}
