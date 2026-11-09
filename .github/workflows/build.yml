@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -32,26 +32,38 @@ jobs:
           path: ~/.buildozer
           key: buildozer-${{ hashFiles('buildozer.spec') }}
 
-      - name: Build APK
+      - name: Build APK (retries on temporary download errors)
         run: |
-          set -o pipefail
-          buildozer -v android debug 2>&1 | tee build.log
+          set +e
+          for attempt in 1 2 3 4; do
+            echo "=== Build attempt $attempt ===" | tee -a build.log
+            buildozer -v android debug 2>&1 | tee -a build.log
+            status=${PIPESTATUS[0]}
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            echo "=== Attempt $attempt failed (exit $status). Waiting 120 seconds, then retrying ===" | tee -a build.log
+            sleep 120
+          done
+          exit 1
 
       - name: Show error summary
         if: failure()
         run: |
-          echo "=== 90 lines before the last STDERR block (where the real error usually is) ==="
+          echo "=== Download lines near the end of the log (shows which web address failed) ==="
+          grep -n -i -E "downloading|download failed|https?://" build.log | grep -v -E "GITHUB_|#     " | sed 's/\x1b\[[0-9;]*m//g' | tail -25
+          echo
+          echo "=== 60 lines before the last STDERR block ==="
           n=$(grep -n "STDERR:" build.log | tail -1 | cut -d: -f1)
           if [ -n "$n" ]; then
-            start=$((n-90)); [ "$start" -lt 1 ] && start=1
+            start=$((n-60)); [ "$start" -lt 1 ] && start=1
             sed -n "${start},${n}p" build.log | sed 's/\x1b\[[0-9;]*m//g'
           else
-            echo "No STDERR block found. Last 80 lines of the log:"
-            tail -80 build.log | sed 's/\x1b\[[0-9;]*m//g'
+            echo "No STDERR block found."
           fi
           echo
-          echo "=== Lines containing error or failed ==="
-          grep -n -i -E "error|failed|fatal|traceback" build.log | grep -v -E "ENVIRONMENT|GITHUB_|#     " | sed 's/\x1b\[[0-9;]*m//g' | tail -40
+          echo "=== Lines containing error or failed (last 25) ==="
+          grep -n -i -E "error|failed|fatal|traceback" build.log | grep -v -E "ENVIRONMENT|GITHUB_|#     " | sed 's/\x1b\[[0-9;]*m//g' | tail -25
 
       - name: Upload full log
         if: always()
